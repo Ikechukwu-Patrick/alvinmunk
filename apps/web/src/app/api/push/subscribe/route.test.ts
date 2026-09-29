@@ -7,17 +7,19 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 vi.mock('@/lib/push-store', () => ({
   saveSubscription: vi.fn(async () => undefined),
   saveSubscriptionWithVouchIds: vi.fn(async () => undefined),
+  saveGeneralSubscription: vi.fn(async () => undefined),
   removeSubscription: vi.fn(async () => undefined),
   getSubscriptionByEndpoint: vi.fn(async () => null),
   moveSubscription: vi.fn(),
 }));
 
 import { PATCH, POST } from './route';
-import { moveSubscription, saveSubscription, saveSubscriptionWithVouchIds } from '@/lib/push-store';
+import { moveSubscription, saveSubscription, saveSubscriptionWithVouchIds, saveGeneralSubscription } from '@/lib/push-store';
 
 const moveMock = vi.mocked(moveSubscription);
 const saveMock = vi.mocked(saveSubscription);
 const saveIdsMock = vi.mocked(saveSubscriptionWithVouchIds);
+const saveGeneralMock = vi.mocked(saveGeneralSubscription);
 
 /** Minimal NextRequest stand-in — the handler only reads headers + json(). */
 function makeReq(body: unknown): Parameters<typeof PATCH>[0] {
@@ -105,6 +107,7 @@ describe('POST /api/push/subscribe (vouchIds re-register, #169)', () => {
   beforeEach(() => {
     saveMock.mockReset();
     saveIdsMock.mockReset();
+    saveGeneralMock.mockReset();
   });
 
   it('routes a vouchIds array to saveSubscriptionWithVouchIds', async () => {
@@ -125,11 +128,31 @@ describe('POST /api/push/subscribe (vouchIds re-register, #169)', () => {
     expect(saveIdsMock).not.toHaveBeenCalled();
   });
 
-  it('rejects a request with no vouch IDs at all → 422', async () => {
+  it('accepts a general opt-in with no vouch IDs (#297)', async () => {
     const res = await POST(makeReq({ subscription: NEW_SUB, walletAddress: 'GABC' }));
+    expect(res.status).toBe(200);
+    expect(saveGeneralMock).toHaveBeenCalledWith(NEW_SUB, 'GABC');
+    expect(saveMock).not.toHaveBeenCalled();
+    expect(saveIdsMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed vouchId → 422', async () => {
+    const res = await POST(
+      makeReq({ subscription: NEW_SUB, walletAddress: 'GABC', vouchId: 'nope' }),
+    );
     expect(res.status).toBe(422);
     expect(saveMock).not.toHaveBeenCalled();
     expect(saveIdsMock).not.toHaveBeenCalled();
+    expect(saveGeneralMock).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed vouchIds array → 422', async () => {
+    const res = await POST(
+      makeReq({ subscription: NEW_SUB, walletAddress: 'GABC', vouchIds: [7, 'x'] }),
+    );
+    expect(res.status).toBe(422);
+    expect(saveIdsMock).not.toHaveBeenCalled();
+    expect(saveGeneralMock).not.toHaveBeenCalled();
   });
 
   it('answers a store failure with a JSON 500 naming the request id (#183)', async () => {

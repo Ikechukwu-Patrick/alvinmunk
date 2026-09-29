@@ -27,7 +27,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server';
-import { removeSubscription, saveSubscription, saveSubscriptionWithVouchIds, moveSubscription } from '@/lib/push-store';
+import { removeSubscription, saveSubscription, saveSubscriptionWithVouchIds, saveGeneralSubscription, moveSubscription } from '@/lib/push-store';
 import { withRoute } from '@/lib/api-route';
 
 const MAX_BODY = 4096;
@@ -48,29 +48,43 @@ export const POST = withRoute('POST /api/push/subscribe', async (req: NextReques
 
   const { subscription, walletAddress } = body;
 
-  // Accept either the legacy single `vouchId` or a `vouchIds` array (used when a rotated
-  // subscription re-registers with every still-pending vouch).
-  const vouchIds = Array.isArray(body.vouchIds)
-    ? body.vouchIds.filter((v): v is number => typeof v === 'number' && Number.isFinite(v))
-    : typeof body.vouchId === 'number' && Number.isFinite(body.vouchId)
-      ? [body.vouchId]
-      : [];
+  // Three shapes are accepted:
+  //   - vouchIds: number[]  → re-register for every still-pending vouch (rotated SW, #169)
+  //   - vouchId: number     → legacy single-vouch subscription
+  //   - neither             → general opt-in with no vouch (#297)
+  //
+  // Malformed shape (present but not a finite number, or an array with non-numbers)
+  // is rejected 422 so the type check is not silently loosened.
+  const hasVouchId = body.vouchId !== undefined;
+  const hasVouchIds = body.vouchIds !== undefined;
+  if (hasVouchId && (typeof body.vouchId !== 'number' || !Number.isFinite(body.vouchId))) {
+    return NextResponse.json({ error: 'invalid vouchId' }, { status: 422 });
+  }
+  if (
+    hasVouchIds &&
+    (!Array.isArray(body.vouchIds) ||
+      body.vouchIds.length === 0 ||
+      !body.vouchIds.every((v) => typeof v === 'number' && Number.isFinite(v)))
+  ) {
+    return NextResponse.json({ error: 'invalid vouchIds' }, { status: 422 });
+  }
 
   if (
     !subscription ||
     typeof subscription.endpoint !== 'string' ||
     !subscription.endpoint.startsWith('https://') ||
     !walletAddress ||
-    typeof walletAddress !== 'string' ||
-    vouchIds.length === 0
+    typeof walletAddress !== 'string'
   ) {
     return NextResponse.json({ error: 'missing or invalid fields' }, { status: 422 });
   }
 
-  if (Array.isArray(body.vouchIds)) {
-    await saveSubscriptionWithVouchIds(subscription, walletAddress, vouchIds);
+  if (hasVouchIds) {
+    await saveSubscriptionWithVouchIds(subscription, walletAddress, body.vouchIds as number[]);
+  } else if (hasVouchId) {
+    await saveSubscription(subscription, walletAddress, body.vouchId as number);
   } else {
-    await saveSubscription(subscription, walletAddress, vouchIds[0]);
+    await saveGeneralSubscription(subscription, walletAddress);
   }
 
   return NextResponse.json({ ok: true });
