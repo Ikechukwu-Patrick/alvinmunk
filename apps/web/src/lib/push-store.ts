@@ -31,6 +31,10 @@ type KvStore = {
   smembers: (key: string) => Promise<string[]>;
   sadd: (key: string, member: string) => Promise<void>;
   srem: (key: string, member: string) => Promise<void>;
+  /** Generic string get, used for the cron cursor and seen-event markers. */
+  getString: (key: string) => Promise<string | null>;
+  /** Generic string set with a TTL in seconds, used for seen-event markers. */
+  setString: (key: string, value: string, ttlSeconds?: number) => Promise<void>;
 };
 
 /** Cap endpoint length to avoid KV key blowup. */
@@ -75,6 +79,12 @@ function createKvStore(url: string, token: string): KvStore | null {
     smembers: (key) => redis.smembers(key),
     sadd: (key, member) => redis.sadd(key, member).then(() => undefined),
     srem: (key, member) => redis.srem(key, member).then(() => undefined),
+    getString: (key) => redis.get<string>(key),
+    setString: (key, value, ttlSeconds) =>
+      (ttlSeconds === undefined
+        ? redis.set(key, value)
+        : redis.set(key, value, { ex: ttlSeconds })
+      ).then(() => undefined),
   };
 }
 
@@ -82,6 +92,10 @@ function createKvStore(url: string, token: string): KvStore | null {
 const memStore = new Map<string, StoredSubscription>();
 /** wallet → Set of endpoints */
 const walletIndex = new Map<string, Set<string>>();
+/** Fallback cursor storage when KV is not configured. */
+const memCursors = new Map<string, string>();
+/** Fallback seen-event storage: event id → expiry timestamp (ms). */
+const memSeen = new Map<string, number>();
 
 export function memGet(key: string): StoredSubscription | null {
   return memStore.get(key) ?? null;
@@ -261,4 +275,96 @@ export async function getSubscriptionsForWallet(walletAddress: string): Promise<
   const endpoints = walletIndex.get(wallet) ?? new Set<string>();
   // The index stores bare endpoints (see memSet/memDel), so reconstruct the `sub:` key.
   return [...endpoints].map((ep) => memGet(`sub:${ep}`)).filter(Boolean) as StoredSubscription[];
+}
+
+// ─── Cron cursor + seen-event markers (issue #297) ──────────────────────────
+
+/** KV key for the tip-notification cron's event cursor. */
+const CURSOR_KEY = 'cursor:notify:tip';
+
+/** KV key prefix for the seen-event set. */
+const SEEN_PREFIX = 'seen:notify:tip:';
+
+/** How long a seen-event marker lives. Matches RPC's ~24h event retention. */
+const SEEN_TTL_SECONDS = 24 * 60 * 60;
+
+/** Read the cron cursor. Null on first-ever run. */
+export async function getCursor(): Promise<string | null> {
+  const kv = getKv();
+  if (kv) return kv.getString(CURSOR_KEY);
+  return memCursors.get(CURSOR_KEY) ?? null;
+}
+
+/**
+ * Persist the cron cursor. Called only after the batch of events up to that cursor
+ * has been fully handled (sent or skipped), so a crash does not lose events.
+ */
+export async function setCursor(cursor: string): Promise<void> {
+  const kv = getKv();
+  if (kv) {
+    await kv.setString(CURSOR_KEY, cursor);
+    return;
+  }
+  memCursors.set(CURSOR_KEY, cursor);
+}
+
+/**
+ * Has this event already been processed? Guards against double-sends when the cursor
+ * is only advanced once per batch (Option B).
+ */
+export async function isEventSeen(eventId: string): Promise<boolean> {
+  const key = SEEN_PREFIX + eventId;
+  const kv = getKv();
+  if (kv) return (await kv.getString(key)) !== null;
+  const expiresAt = memSeen.get(key);
+  if (!expiresAt) return false;
+  if (expiresAt < Date.now()) {
+    memSeen.delete(key);
+    return false;
+  }
+  return true;
+}
+
+/** Mark an event as processed so a retried batch does not double-send it. */
+export async function markEventSeen(eventId: string): Promise<void> {
+  const key = SEEN_PREFIX + eventId;
+  const kv = getKv();
+  if (kv) {
+    await kv.setString(key, '1', SEEN_TTL_SECONDS);
+    return;
+  }
+  memSeen.set(key, Date.now() + SEEN_TTL_SECONDS * 1000);
+}
+
+// ─── General opt-in (issue #297) ────────────────────────────────────────────
+
+/**
+ * Upsert a subscription with NO vouch IDs — a general opt-in from the inbox or
+ * dashboard. Preserves any existing vouchIds the record may already carry.
+ */
+export async function saveGeneralSubscription(
+  subscription: PushSubscriptionJSON,
+  walletAddress: string,
+): Promise<void> {
+  if (!subscription.endpoint) throw new Error('[push-store] subscription has no endpoint');
+  const endpoint = subscription.endpoint.slice(0, MAX_ENDPOINT);
+  const key = `sub:${endpoint}`;
+  const wallet = walletAddress.toLowerCase();
+  const kv = getKv();
+
+  const existing = kv ? await kv.get(key) : memGet(key);
+  const record: StoredSubscription = {
+    endpoint,
+    subscription,
+    walletAddress: wallet,
+    vouchIds: existing?.vouchIds ?? [],
+    updatedAt: Date.now(),
+  };
+
+  if (kv) {
+    await kv.set(key, record);
+    await kv.sadd(`wallet:${wallet}`, endpoint);
+  } else {
+    memSet(key, record);
+  }
 }
