@@ -227,3 +227,68 @@ async function scanContractEvents(
   }
   return out;
 }
+
+/**
+ * `tipped` events since `cursor` (or since the start of the recent window if `cursor`
+ * is null), newest at the end, plus the cursor to pass on the next call.
+ *
+ * This is the cursor-based reader for the tip-notification cron (#297). It does NOT
+ * share `pendingScans` with the window-based readers: a cursor makes each call
+ * distinct, so it cannot be deduplicated by contract+topic key.
+ *
+ * On the first-ever call (`cursor === null`) it falls back to the recent window so
+ * the very first cron run does not scan from genesis. Every subsequent run resumes
+ * exactly where the last one stopped, so events are never skipped.
+ */
+export async function fetchTipEventsSince(cursor: string | null): Promise<{
+  events: RepEvent[];
+  cursor: string | null;
+}> {
+  if (!config.contracts.rewards) return { events: [], cursor };
+
+  const tipped = xdr.ScVal.scvSymbol(EVENTS.TIPPED).toXDR('base64');
+  const filters: rpc.Api.EventFilter[] = [
+    { type: 'contract', contractIds: [config.contracts.rewards], topics: [[tipped, '*', '*']] },
+  ];
+
+  let startLedger: number | undefined;
+  if (!cursor) {
+    try {
+      const latest = await server.getLatestLedger();
+      startLedger = Math.max(1, latest.sequence - EVENT_LEDGER_WINDOW);
+    } catch {
+      return { events: [], cursor };
+    }
+  }
+
+  const out: RepEvent[] = [];
+  let nextCursor: string | null = cursor;
+  let firstPage = true;
+  try {
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const query =
+        firstPage && startLedger !== undefined
+          ? { filters, startLedger, limit: PAGE_SIZE }
+          : { filters, cursor: nextCursor as string, limit: PAGE_SIZE };
+      const res = await server.getEvents(query);
+      for (const ev of res.events) {
+        // Without an RPC event id we cannot deduplicate across cron runs — skip.
+        if (!ev.id) continue;
+        out.push({
+          id: ev.id,
+          topics: (ev.topic as Array<xdr.ScVal | string>).map(decodeScVal),
+          data: decodeScVal(ev.value as xdr.ScVal | string),
+          ledger: ev.ledger,
+        });
+      }
+      if (res.cursor) nextCursor = res.cursor;
+      firstPage = false;
+      if (res.events.length < PAGE_SIZE || !res.cursor) break;
+    }
+  } catch {
+    // Mid-scan RPC error: return what we have plus the last good cursor so the next
+    // cron run resumes cleanly. The seen-event set covers any overlap.
+    return { events: out, cursor: nextCursor };
+  }
+  return { events: out, cursor: nextCursor };
+}

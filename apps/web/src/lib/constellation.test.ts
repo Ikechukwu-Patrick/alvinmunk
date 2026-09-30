@@ -72,6 +72,7 @@ const B = 'G'.padEnd(56, 'B');
 const C = 'G'.padEnd(56, 'C');
 
 const claimed = (id: number, from: string, claimer: string): RepEvent => ({
+  id: `evt-${id}`,
   topics: ['vouch', 'claimed'],
   data: [id, from, claimer],
   ledger: id,
