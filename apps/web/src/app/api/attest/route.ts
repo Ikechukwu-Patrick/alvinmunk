@@ -8,7 +8,9 @@
  * pubkey must be allowlisted via `quest_registry.add_attester_key`.
  *
  * Only cryptographically / API-verifiable quests are accepted (00-strategy §1):
- *   - github_pr   : evidence.ref = "owner/repo#123" -> PR must be merged
+ *   - github_pr   : evidence.ref = "owner/repo#123" -> PR must be merged, in a repo on the
+ *                   QUEST_GITHUB_REPOS allowlist (none set = none eligible), not by a bot, and
+ *                   its description must name the recipient's address and no other (#163)
  *   - referral_tx : evidence.ref = a G… or C… address -> must be active (Social score > 0)
  *                   and name the recipient as its inviter: registry `invited_by` (any wallet
  *                   kind), else a classic account's "referral" manageData entry
@@ -19,7 +21,7 @@
  *
  * Defense-in-depth (belts/08 §security): on-chain recipient.require_auth() ownership +
  * on-chain replay guard (the hard cap), each quest id bound to one evidence type, per-IP
- * rate limit, bounded body, optional GitHub repo allowlist, self-referral guard. The
+ * rate limit, bounded body, required GitHub repo allowlist, self-referral guard. The
  * signature is only redeemable by the recipient (they must satisfy require_auth), so
  * issuing it carries no transfer of funds.
  */
@@ -46,6 +48,7 @@ import {
   isValidQuestId,
   judgeReferral,
   parseRepoAllowlist,
+  prBodyNamesRecipient,
   questWindow,
   repoAllowed,
   signQuestPayload,
@@ -279,31 +282,12 @@ async function verifyEvidence(
       user?: { type?: string } | null;
     } | null;
     if (pr?.merged !== true) return { ok: false, reason: 'PR not merged' };
-
-    // Bind the PR to the recipient (#163): the PR body must name the recipient's
-    // Stellar address and no other, so one PR maps to one wallet. Without this, any
-    // wallet can cite any merged PR and redeem the quest once — the on-chain replay
-    // guard is keyed only by (quest_id, recipient) and does not link them.
-    if (pr.user?.type === 'Bot') {
-      return { ok: false, reason: 'PRs authored by bots do not qualify' };
-    }
-    const bodyText = pr.body ?? '';
-    const addresses = bodyText.match(/\b[GC][A-Z2-7]{55}\b/g) ?? [];
-    if (addresses.length === 0) {
-      return {
-        ok: false,
-        reason: 'the PR body must contain your Stellar address so this quest binds to you',
-      };
-    }
-    if (addresses.length > 1) {
-      return { ok: false, reason: 'the PR body names more than one Stellar address' };
-    }
-    if (addresses[0] !== recipient) {
-      return {
-        ok: false,
-        reason: 'the Stellar address in the PR body is not the recipient’s',
-      };
-    }
+    if (pr.user?.type === 'Bot') return { ok: false, reason: 'PRs authored by bots do not qualify' };
+    // Bind the PR to the recipient (#163): its body must name the recipient's address and no
+    // other, so one PR maps to one wallet. Without this any wallet could cite any merged PR,
+    // since the on-chain replay guard is keyed by (quest_id, recipient) alone.
+    const bound = prBodyNamesRecipient(pr.body, recipient);
+    if (!bound.ok) return bound;
     if (since !== null && !(Date.parse(pr.merged_at ?? '') / 1000 >= since)) {
       return { ok: false, reason: 'that PR was merged before this round — this quest needs a new one' };
     }
