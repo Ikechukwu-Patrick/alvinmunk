@@ -55,10 +55,15 @@ self.addEventListener('push', (event) => {
     body: payload.body,
     icon: '/assets/brand/alvinmunk-icon-192.png',
     badge: '/assets/brand/alvinmunk-badge-96.png',
-    tag: `vouch-claimed-${payload.vouchId ?? 'unknown'}`,
+    // Server-supplied tag lets tip notifications (#297) replace per-tip instead of
+    // colliding on the same default key. Vouch-claimed notifications keep their
+    // existing tag shape.
+    tag: payload.tag ?? `vouch-claimed-${payload.vouchId ?? 'unknown'}`,
     renotify: false,               // same tag → replace, not a second buzz
     data: {
-      url: payload.vouchId ? `/app` : APP_ORIGIN,
+      // Server-supplied url (e.g. /app from the tip cron, #297). Falls back to the
+      // vouch-claimed default so existing notifications keep working unchanged.
+      url: payload.url ?? (payload.vouchId ? `/app` : APP_ORIGIN),
       vouchId: payload.vouchId,
     },
   };
