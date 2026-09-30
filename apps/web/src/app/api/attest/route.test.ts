@@ -161,6 +161,7 @@ describe('POST /api/attest quest ↔ evidence binding', () => {
   it('binds a quest id configured in env, not its default', async () => {
     vi.resetModules();
     vi.stubEnv('QUEST_GITHUB_ID', '1');
+    vi.stubEnv('QUEST_GITHUB_REPOS', 'o/r');
     vi.stubEnv('NEXT_PUBLIC_VOUCHBACK_QUEST_ID', '5');
     ({ POST } = (await import('./route')) as { POST: Post });
     // quest 4 is no longer the vouch_back quest
@@ -431,8 +432,11 @@ describe('POST /api/attest — status codes (issue #180)', () => {
   it('422 when PR is not merged', async () => {
     vi.resetModules();
     vi.stubEnv('QUEST_GITHUB_ID', '1');
+    vi.stubEnv('QUEST_GITHUB_REPOS', 'owner/repo');
     ({ POST } = (await import('./route')) as { POST: Post });
-    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ merged: false }), { status: 200 }));
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ merged: false, body: 'Binds to ' + RECIPIENT }), { status: 200 }),
+    );
     const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#42' } });
     expect(res.status).toBe(422);
     const body = (await res.json()) as { error: string };
@@ -442,6 +446,7 @@ describe('POST /api/attest — status codes (issue #180)', () => {
   it('422 when GitHub API returns non-200', async () => {
     vi.resetModules();
     vi.stubEnv('QUEST_GITHUB_ID', '1');
+    vi.stubEnv('QUEST_GITHUB_REPOS', 'owner/repo');
     ({ POST } = (await import('./route')) as { POST: Post });
     fetchSpy.mockResolvedValueOnce(new Response('', { status: 404 }));
     const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#99' } });
@@ -450,13 +455,97 @@ describe('POST /api/attest — status codes (issue #180)', () => {
     expect(body.error).toMatch(/github 404/i);
   });
 
+  // ── 422: recipient binding (#163) ─────────────────────────────────────────
+
+  it('422 when QUEST_GITHUB_REPOS is unset (fail closed)', async () => {
+    vi.resetModules();
+    vi.stubEnv('QUEST_GITHUB_ID', '1');
+    // QUEST_GITHUB_REPOS deliberately not stubbed
+    ({ POST } = (await import('./route')) as { POST: Post });
+    const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } });
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/no repo allowlist/i);
+  });
+
+  it('422 when the PR body has no Stellar address', async () => {
+    vi.resetModules();
+    vi.stubEnv('QUEST_GITHUB_ID', '1');
+    vi.stubEnv('QUEST_GITHUB_REPOS', 'owner/repo');
+    ({ POST } = (await import('./route')) as { POST: Post });
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ merged: true, body: 'no address here' }), { status: 200 }),
+    );
+    const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } });
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/must contain your Stellar address/i);
+  });
+
+  it('422 when the PR body names two different Stellar addresses', async () => {
+    vi.resetModules();
+    vi.stubEnv('QUEST_GITHUB_ID', '1');
+    vi.stubEnv('QUEST_GITHUB_REPOS', 'owner/repo');
+    ({ POST } = (await import('./route')) as { POST: Post });
+    const other = Keypair.random().publicKey();
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ merged: true, body: `Binds to ${RECIPIENT} not ${other}` }),
+        { status: 200 },
+      ),
+    );
+    const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } });
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/more than one/i);
+  });
+
+  it('422 when the PR body address is not the recipient’s', async () => {
+    vi.resetModules();
+    vi.stubEnv('QUEST_GITHUB_ID', '1');
+    vi.stubEnv('QUEST_GITHUB_REPOS', 'owner/repo');
+    ({ POST } = (await import('./route')) as { POST: Post });
+    const other = Keypair.random().publicKey();
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ merged: true, body: `Binds to ${other}` }), { status: 200 }),
+    );
+    const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } });
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/not the recipient/i);
+  });
+
+  it('422 when the PR author is a bot', async () => {
+    vi.resetModules();
+    vi.stubEnv('QUEST_GITHUB_ID', '1');
+    vi.stubEnv('QUEST_GITHUB_REPOS', 'owner/repo');
+    ({ POST } = (await import('./route')) as { POST: Post });
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          merged: true,
+          body: `Binds to ${RECIPIENT}`,
+          user: { type: 'Bot' },
+        }),
+        { status: 200 },
+      ),
+    );
+    const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } });
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/bots do not qualify/i);
+  });
+
   // ── signing: local, never fed by an RPC node (issue #142) ───────────────────
 
   it('signs without any RPC read, so a failing RPC node can neither block nor feed it', async () => {
     vi.resetModules();
     vi.stubEnv('QUEST_GITHUB_ID', '1');
+    vi.stubEnv('QUEST_GITHUB_REPOS', 'owner/repo');
     ({ POST } = (await import('./route')) as { POST: Post });
-    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ merged: true }), { status: 200 }));
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ merged: true, body: 'Binds to ' + RECIPIENT }), { status: 200 }),
+    );
     simulateSpy.mockRejectedValue(new Error('rpc timeout'));
     const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } });
     expect(res.status).toBe(200);
@@ -467,8 +556,11 @@ describe('POST /api/attest — status codes (issue #180)', () => {
     vi.resetModules();
     vi.stubEnv('ATTESTER_SECRET_KEY', 'SNOTASECRET');
     vi.stubEnv('QUEST_GITHUB_ID', '1');
+    vi.stubEnv('QUEST_GITHUB_REPOS', 'owner/repo');
     ({ POST } = (await import('./route')) as { POST: Post });
-    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ merged: true }), { status: 200 }));
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ merged: true, body: 'Binds to ' + RECIPIENT }), { status: 200 }),
+    );
     const res = await attest({ questId: 1, evidence: { type: 'github_pr', ref: 'owner/repo#1' } });
     expect(res.status).toBe(500);
     expect(((await res.json()) as { sig?: string }).sig).toBeUndefined();
@@ -481,8 +573,11 @@ describe('POST /api/attest — status codes (issue #180)', () => {
     vi.resetModules();
     vi.stubEnv('ATTESTER_SECRET_KEY', attesterKp.secret());
     vi.stubEnv('QUEST_GITHUB_ID', '5');
+    vi.stubEnv('QUEST_GITHUB_REPOS', 'owner/repo');
     ({ POST } = (await import('./route')) as { POST: Post });
-    fetchSpy.mockResolvedValueOnce(new Response(JSON.stringify({ merged: true }), { status: 200 }));
+    fetchSpy.mockResolvedValueOnce(
+      new Response(JSON.stringify({ merged: true, body: 'Binds to ' + RECIPIENT }), { status: 200 }),
+    );
 
     const res = await attest({
       questId: 5,

@@ -204,17 +204,58 @@ async function verifyEvidence(
     const m = ev.ref.match(/^([\w.-]+)\/([\w.-]+)#(\d+)$/);
     if (!m) return { ok: false, reason: 'ref must be owner/repo#number' };
     const [, owner, repo, num] = m;
+
+    // Fail closed: an unset allowlist used to allow every repo, so any merged PR on
+    // GitHub qualified. Until a repo is explicitly allowed, reject github_pr evidence.
+    if (REPO_ALLOWLIST === null) {
+      return {
+        ok: false,
+        reason:
+          'github_pr is disabled — no repo allowlist is configured (set QUEST_GITHUB_REPOS)',
+      };
+    }
     if (!repoAllowed(REPO_ALLOWLIST, owner, repo)) {
       return { ok: false, reason: 'repo not eligible for this quest' };
     }
+
     const headers: Record<string, string> = { accept: 'application/vnd.github+json' };
     if (process.env.GITHUB_TOKEN) headers.authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
     const r = await fetch(`https://api.github.com/repos/${owner}/${repo}/pulls/${num}`, {
       headers,
     });
     if (!r.ok) return { ok: false, reason: `github ${r.status}` };
-    const pr = (await r.json()) as { merged?: boolean };
-    return pr.merged ? { ok: true } : { ok: false, reason: 'PR not merged' };
+    const pr = (await r.json()) as {
+      merged?: boolean;
+      body?: string | null;
+      user?: { type?: string } | null;
+    };
+    if (pr.merged !== true) return { ok: false, reason: 'PR not merged' };
+
+    // Bind the PR to the recipient (#163): the PR body must name the recipient's
+    // Stellar address and no other, so one PR maps to one wallet. Without this, any
+    // wallet can cite any merged PR and redeem the quest once — the on-chain replay
+    // guard is keyed only by (quest_id, recipient) and does not link them.
+    if (pr.user?.type === 'Bot') {
+      return { ok: false, reason: 'PRs authored by bots do not qualify' };
+    }
+    const bodyText = pr.body ?? '';
+    const addresses = bodyText.match(/\b[GC][A-Z2-7]{55}\b/g) ?? [];
+    if (addresses.length === 0) {
+      return {
+        ok: false,
+        reason: 'the PR body must contain your Stellar address so this quest binds to you',
+      };
+    }
+    if (addresses.length > 1) {
+      return { ok: false, reason: 'the PR body names more than one Stellar address' };
+    }
+    if (addresses[0] !== recipient) {
+      return {
+        ok: false,
+        reason: 'the Stellar address in the PR body is not the recipient’s',
+      };
+    }
+    return { ok: true };
   }
 
   if (ev.type === 'referral_tx') {
