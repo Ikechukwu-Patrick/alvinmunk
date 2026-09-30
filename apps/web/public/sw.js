@@ -51,19 +51,23 @@ self.addEventListener('push', (event) => {
     }
   }
 
+  // A server-supplied target (the tip cron sends /app/inbox, #297) — only a same-origin
+  // path, never another site; otherwise the vouch-claimed default.
+  const url =
+    typeof payload.url === 'string' && payload.url.startsWith('/') && !payload.url.startsWith('//')
+      ? payload.url
+      : payload.vouchId ? `/app` : APP_ORIGIN;
+
   const options = {
     body: payload.body,
     icon: '/assets/brand/alvinmunk-icon-192.png',
     badge: '/assets/brand/alvinmunk-badge-96.png',
-    // Server-supplied tag lets tip notifications (#297) replace per-tip instead of
-    // colliding on the same default key. Vouch-claimed notifications keep their
-    // existing tag shape.
-    tag: payload.tag ?? `vouch-claimed-${payload.vouchId ?? 'unknown'}`,
+    // A server-supplied tag (one per tip, #297) keeps two tips from replacing each other;
+    // vouch-claimed notifications keep their tag shape.
+    tag: typeof payload.tag === 'string' ? payload.tag : `vouch-claimed-${payload.vouchId ?? 'unknown'}`,
     renotify: false,               // same tag → replace, not a second buzz
     data: {
-      // Server-supplied url (e.g. /app from the tip cron, #297). Falls back to the
-      // vouch-claimed default so existing notifications keep working unchanged.
-      url: payload.url ?? (payload.vouchId ? `/app` : APP_ORIGIN),
+      url,
       vouchId: payload.vouchId,
     },
   };

@@ -228,67 +228,79 @@ async function scanContractEvents(
   return out;
 }
 
-/**
- * `tipped` events since `cursor` (or since the start of the recent window if `cursor`
- * is null), newest at the end, plus the cursor to pass on the next call.
- *
- * This is the cursor-based reader for the tip-notification cron (#297). It does NOT
- * share `pendingScans` with the window-based readers: a cursor makes each call
- * distinct, so it cannot be deduplicated by contract+topic key.
- *
- * On the first-ever call (`cursor === null`) it falls back to the recent window so
- * the very first cron run does not scan from genesis. Every subsequent run resumes
- * exactly where the last one stopped, so events are never skipped.
- */
-export async function fetchTipEventsSince(cursor: string | null): Promise<{
+/** One `fetchTipEventsSince` read: the events, where to resume, and whether the RPC answered. */
+export interface TipEventsSince {
   events: RepEvent[];
   cursor: string | null;
-}> {
-  if (!config.contracts.rewards) return { events: [], cursor };
+  /** False when the RPC couldn't be read at all; `cursor` is then the one passed in. */
+  ok: boolean;
+}
+
+/**
+ * `tipped` events after `cursor` (topics ('tipped', from, to) · data amount), oldest-first,
+ * and the RPC cursor to resume from — the reader of the tip-notification cron (#297). It
+ * shares no scan or cache with the window readers: each call starts where the last stopped.
+ *   - No cursor yet (the cron's first run): start at the latest ledger. Tips from before
+ *     the cron existed are history, not news, so nobody gets a burst of stale pushes.
+ *   - A cursor the RPC rejects — it fell out of retention after a long gap, or the RPC was
+ *     swapped — restarts at the recent window (`EVENT_LEDGER_WINDOW`) instead of failing on
+ *     every run; the caller's per-event claims keep the overlap from being pushed twice.
+ *   - Pages follow the cursor while it moves: a short page ends one 10,000-ledger RPC scan,
+ *     not necessarily the gap since the last run, so the read stops only once a page leaves
+ *     the cursor where it was (caught up) or after MAX_PAGES; the next call carries on.
+ *   - A later page failing keeps what was read, with the cursor after it.
+ * Events without an RPC id are dropped: nothing could keep them from being pushed twice.
+ */
+export async function fetchTipEventsSince(cursor: string | null): Promise<TipEventsSince> {
+  const contractId = config.contracts.rewards;
+  if (!contractId) return { events: [], cursor, ok: true };
 
   const tipped = xdr.ScVal.scvSymbol(EVENTS.TIPPED).toXDR('base64');
   const filters: rpc.Api.EventFilter[] = [
-    { type: 'contract', contractIds: [config.contracts.rewards], topics: [[tipped, '*', '*']] },
+    { type: 'contract', contractIds: [contractId], topics: [[tipped, '*', '*']] },
   ];
+  const fromCursor = (c: string) => server.getEvents({ filters, cursor: c, limit: PAGE_SIZE });
+  const fromLedger = (startLedger: number) => server.getEvents({ filters, startLedger, limit: PAGE_SIZE });
 
-  let startLedger: number | undefined;
-  if (!cursor) {
-    try {
-      const latest = await server.getLatestLedger();
-      startLedger = Math.max(1, latest.sequence - EVENT_LEDGER_WINDOW);
-    } catch {
-      return { events: [], cursor };
+  let res: rpc.Api.GetEventsResponse;
+  try {
+    if (cursor) {
+      try {
+        res = await fromCursor(cursor);
+      } catch {
+        const latest = await server.getLatestLedger();
+        res = await fromLedger(Math.max(1, latest.sequence - EVENT_LEDGER_WINDOW));
+      }
+    } else {
+      res = await fromLedger((await server.getLatestLedger()).sequence);
     }
+  } catch {
+    return { events: [], cursor, ok: false };
   }
 
   const out: RepEvent[] = [];
-  let nextCursor: string | null = cursor;
-  let firstPage = true;
-  try {
-    for (let page = 0; page < MAX_PAGES; page++) {
-      const query =
-        firstPage && startLedger !== undefined
-          ? { filters, startLedger, limit: PAGE_SIZE }
-          : { filters, cursor: nextCursor as string, limit: PAGE_SIZE };
-      const res = await server.getEvents(query);
-      for (const ev of res.events) {
-        // Without an RPC event id we cannot deduplicate across cron runs — skip.
-        if (!ev.id) continue;
-        out.push({
-          id: ev.id,
-          topics: (ev.topic as Array<xdr.ScVal | string>).map(decodeScVal),
-          data: decodeScVal(ev.value as xdr.ScVal | string),
-          ledger: ev.ledger,
-        });
-      }
-      if (res.cursor) nextCursor = res.cursor;
-      firstPage = false;
-      if (res.events.length < PAGE_SIZE || !res.cursor) break;
+  let next = cursor;
+  let asked: string | null = cursor;
+  for (let page = 1; ; page++) {
+    for (const ev of res.events) {
+      if (!ev.id) continue;
+      out.push({
+        id: ev.id,
+        topics: (ev.topic as Array<xdr.ScVal | string>).map(decodeScVal),
+        data: decodeScVal(ev.value as xdr.ScVal | string),
+        ledger: ev.ledger,
+      });
     }
-  } catch {
-    // Mid-scan RPC error: return what we have plus the last good cursor so the next
-    // cron run resumes cleanly. The seen-event set covers any overlap.
-    return { events: out, cursor: nextCursor };
+    if (!res.cursor) break;
+    next = res.cursor;
+    const caughtUp = res.events.length < PAGE_SIZE && res.cursor === asked;
+    if (caughtUp || page >= MAX_PAGES) break;
+    asked = res.cursor;
+    try {
+      res = await fromCursor(res.cursor);
+    } catch {
+      break;
+    }
   }
-  return { events: out, cursor: nextCursor };
+  return { events: out, cursor: next, ok: true };
 }
