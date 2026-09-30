@@ -33,18 +33,21 @@ vi.mock('@stellar/stellar-sdk', async (importOriginal) => {
     ...real,
     rpc: {
       ...real.rpc,
-      Server: vi.fn().mockImplementation(() => ({
-        getHealth:           getHealthMock,
-        getEvents:           getEventsMock,
-        simulateTransaction: simulateMock,
-        getLatestLedger:     vi.fn(),
-      })),
+      // `new rpc.Server(...)`: Vitest 4 constructs the implementation, so it must be a `function`.
+      Server: vi.fn().mockImplementation(function () {
+        return {
+          getHealth:           getHealthMock,
+          getEvents:           getEventsMock,
+          simulateTransaction: simulateMock,
+          getLatestLedger:     vi.fn(),
+        };
+      }),
       Api: real.rpc.Api,
     },
   };
 });
 
-import { decodeVouchClaimedEvent } from './route';
+import { decodeVouchClaimedEvent } from '@/lib/vouch-claimed';
 import { DEFAULT_QUEST_IDS } from '@/lib/attest';
 
 // ── shared fixtures ───────────────────────────────────────────────────────────

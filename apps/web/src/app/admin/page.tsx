@@ -19,7 +19,15 @@ import {
   type RewardEntry,
 } from '@/lib/rewards';
 import { createGate, readGates, setGateActive, TRACK, type Gate } from '@/lib/gate';
-import { createQuest, readQuest, setQuestActive, type QuestConfig } from '@/lib/quests';
+import {
+  createQuest,
+  getQuestPeriods,
+  readQuest,
+  setQuestActive,
+  setQuestPeriod,
+  type QuestConfig,
+} from '@/lib/quests';
+import { WEEK_SECS } from '@/lib/attest';
 import {
   CONTENT_SECTIONS,
   adminErrorMessage,
@@ -28,6 +36,7 @@ import {
   manageableSections,
   parseU32,
   questConsequence,
+  questPeriodConsequence,
   questToggleConsequence,
   readContentAdmins,
   rewardConsequence,
@@ -125,7 +134,7 @@ export default function AdminPage() {
   const current = sections.includes(section) ? section : sections[0];
   return (
     <div className="container max-w-5xl py-12">
-      <p className="text-xs uppercase tracking-[0.25em] text-secondary">admin // content</p>
+      <p className="eyebrow text-secondary">admin // content</p>
       <div className="mt-2 flex flex-wrap items-center gap-3">
         <h1 className="text-3xl font-semibold">Content</h1>
         <Badge variant="onchain">on-chain admin · {shortAddr(wallet.address)}</Badge>
@@ -164,7 +173,7 @@ export default function AdminPage() {
 function Shell({ children }: { children: React.ReactNode }) {
   return (
     <div className="container max-w-5xl py-12">
-      <p className="text-xs uppercase tracking-[0.25em] text-secondary">admin</p>
+      <p className="eyebrow text-secondary">admin</p>
       <div className="mt-3">{children}</div>
     </div>
   );
@@ -559,14 +568,19 @@ function GatesAdmin({ wallet }: { wallet: Wallet }) {
 function QuestsAdmin({ wallet }: { wallet: Wallet }) {
   const [lookupId, setLookupId] = useState('');
   // The quest shown under the lookup: `null` = no such quest, undefined = nothing looked up.
-  const [found, setFound] = useState<{ id: number; quest: QuestConfig | null } | undefined>();
+  // `period` is its repeat period in seconds (0 = one-shot, also on a contract without
+  // repeatable quests).
+  const [found, setFound] = useState<
+    { id: number; quest: QuestConfig | null; period: number } | undefined
+  >();
   const [lookupError, setLookupError] = useState<string | null>(null);
   const [form, setForm] = useState({ id: '', schemaId: '', xp: '' });
 
   const lookup = useCallback(async (id: number) => {
     setLookupError(null);
     try {
-      setFound({ id, quest: await readQuest(id) });
+      const [quest, periods] = await Promise.all([readQuest(id), getQuestPeriods([id])]);
+      setFound({ id, quest, period: periods?.get(id) ?? 0 });
     } catch (e) {
       setFound(undefined);
       setLookupError(adminErrorMessage('quests', e));
@@ -585,13 +599,17 @@ function QuestsAdmin({ wallet }: { wallet: Wallet }) {
     if (!v.ok) return write.reject(v.error);
     const d = v.value;
     let current: QuestConfig | null;
+    let period = 0;
     try {
-      current = await readQuest(d.id); // new vs replace changes the consequence
+      // new vs replace, and one-shot vs repeating, change the consequence
+      const [quest, periods] = await Promise.all([readQuest(d.id), getQuestPeriods([d.id])]);
+      current = quest;
+      period = periods?.get(d.id) ?? 0;
     } catch (e) {
       return write.reject(adminErrorMessage('quests', e));
     }
     write.review(
-      questConsequence(d, current),
+      questConsequence(d, current, period),
       () => createQuest(wallet, d.id, d.schemaId, d.xp),
       () => {
         setForm({ id: '', schemaId: '', xp: '' });
@@ -602,6 +620,7 @@ function QuestsAdmin({ wallet }: { wallet: Wallet }) {
   }
 
   const q = found?.quest;
+  const period = found?.period ?? 0;
   return (
     <Panel
       title="Quests"
@@ -632,6 +651,28 @@ function QuestsAdmin({ wallet }: { wallet: Wallet }) {
             <Badge variant={q.active ? 'success' : 'default'}>
               {q.active ? 'active' : 'disabled'}
             </Badge>
+            <Badge variant="default">
+              {period === WEEK_SECS
+                ? 'weekly'
+                : period > 0
+                  ? `every ${Math.round(period / 86_400)}d`
+                  : 'one-shot'}
+            </Badge>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={write.busy}
+              onClick={() => {
+                const next = period > 0 ? 0 : WEEK_SECS;
+                write.review(
+                  questPeriodConsequence(q, next),
+                  () => setQuestPeriod(wallet, q.id, next),
+                  () => void lookup(q.id),
+                );
+              }}
+            >
+              {period > 0 ? 'Make one-shot' : 'Make weekly'}
+            </Button>
             <Button
               size="sm"
               variant="ghost"

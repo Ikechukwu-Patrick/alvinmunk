@@ -1,5 +1,6 @@
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
+import { TxNotQueuedError, TxRejectedError } from './tx-errors';
 
 /** Merge conditional class names + dedupe Tailwind conflicts. */
 export function cn(...inputs: ClassValue[]): string {
@@ -27,6 +28,8 @@ export function humanizeError(
   codeMap: Record<number, string> = {},
   flow?: ErrorFlow,
 ): string {
+  // Already one plain sentence (lib/tx-errors) — the keyword rules below would misread it.
+  if (e instanceof TxRejectedError || e instanceof TxNotQueuedError) return e.message;
   const raw = e instanceof Error ? e.message : String(e ?? 'Something went wrong');
   // Host-level signals first — they're clearer than a contract code AND dodge code
   // collisions (e.g. a token SAC's own #10 "insufficient balance" vs a contract's #10).
@@ -103,4 +106,29 @@ export function shareInFlight<T>(
   const p = run().finally(() => pending.delete(key));
   pending.set(key, p);
   return p;
+}
+
+/**
+ * A gate that runs at most `limit` tasks at once, starting the rest in call order as slots
+ * free up — so a batch of reads (every stored vouch is one simulation) trickles out
+ * instead of bursting into the public RPC's rate limit. A freed slot passes straight to the
+ * next waiter, so a caller arriving in between can't push the count past `limit`.
+ */
+export function concurrencyLimit(limit: number): <T>(run: () => Promise<T>) => Promise<T> {
+  let active = 0;
+  const waiting: Array<() => void> = [];
+  const release = () => {
+    const next = waiting.shift();
+    if (next) next();
+    else active--;
+  };
+  return async <T>(run: () => Promise<T>): Promise<T> => {
+    if (active < limit) active++;
+    else await new Promise<void>((resolve) => waiting.push(resolve));
+    try {
+      return await run();
+    } finally {
+      release();
+    }
+  };
 }

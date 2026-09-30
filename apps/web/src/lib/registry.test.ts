@@ -19,11 +19,17 @@ vi.mock('./contracts', () => ({
   },
 }));
 
+// resolveHandle / reverseHandle read through the app's @alvinmunk/sdk client (its own tests
+// pin the views and arguments against a mocked RPC); here it is a stub.
+const sdkMock = vi.hoisted(() => ({ resolveHandle: vi.fn(), reverseHandle: vi.fn() }));
+vi.mock('./sdk', () => ({ readClient: () => sdkMock }));
+
 import {
   getMeta,
   setMeta,
   clearMetaCache,
   isMetaUnsupported,
+  resolveHandle,
   reverseHandle,
   reverseHandles,
   getHandleCooldown,
@@ -32,6 +38,7 @@ import {
   transferHandle,
 } from './registry';
 import type { Wallet } from './wallet';
+import type { ReadNetwork } from './read-network';
 
 const G = 'G'.padEnd(56, 'A');
 const wallet = { kind: 'dev', address: G } as unknown as Wallet;
@@ -55,7 +62,7 @@ describe('getMeta', () => {
       avatar: { kind: 'kit', skin: 3, hair: 7, eyes: 5, mouth: 4, acc: 9, bg: 2 },
       bio: 'hi there',
     });
-    expect(readPublicMock).toHaveBeenCalledWith('CREGISTRY', 'get_meta', [{ __addr: G }]);
+    expect(readPublicMock).toHaveBeenCalledWith('CREGISTRY', 'get_meta', [{ __addr: G }], undefined);
   });
 
   it('is null when the address never published a profile', async () => {
@@ -173,19 +180,20 @@ describe('isMetaUnsupported', () => {
 describe('reverseHandle', () => {
   beforeEach(() => {
     readPublicMock.mockReset();
+    sdkMock.reverseHandle.mockReset();
     registry = 'CREGISTRY';
   });
 
   it("reads the address's handle, null when it holds none", async () => {
-    readPublicMock.mockResolvedValueOnce('alvin').mockResolvedValueOnce(null);
+    sdkMock.reverseHandle.mockResolvedValueOnce('alvin').mockResolvedValueOnce(null);
     await expect(reverseHandle(G)).resolves.toBe('alvin');
     await expect(reverseHandle(G, { strict: true })).resolves.toBeNull();
-    expect(readPublicMock).toHaveBeenCalledWith('CREGISTRY', 'reverse', [{ __addr: G }]);
+    expect(sdkMock.reverseHandle.mock.calls).toEqual([[G], [G]]);
   });
 
   it('answers null for a failed read — unless strict, which throws it', async () => {
     const down = new Error('fetch failed');
-    readPublicMock.mockRejectedValue(down);
+    sdkMock.reverseHandle.mockRejectedValue(down);
     await expect(reverseHandle(G)).resolves.toBeNull();
     await expect(reverseHandle(G, { strict: true })).rejects.toBe(down);
   });
@@ -193,7 +201,33 @@ describe('reverseHandle', () => {
   it('is null without a configured registry, strict or not, and never calls the RPC', async () => {
     registry = '';
     await expect(reverseHandle(G, { strict: true })).resolves.toBeNull();
+    expect(sdkMock.reverseHandle).not.toHaveBeenCalled();
     expect(readPublicMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('resolveHandle', () => {
+  beforeEach(() => {
+    sdkMock.resolveHandle.mockReset();
+    registry = 'CREGISTRY';
+  });
+
+  it("reads the handle's holder, null when unclaimed or unreadable", async () => {
+    sdkMock.resolveHandle
+      .mockResolvedValueOnce(G)
+      .mockResolvedValueOnce(null)
+      .mockRejectedValueOnce(new Error('fetch failed'));
+    await expect(resolveHandle('alvin')).resolves.toBe(G);
+    await expect(resolveHandle('nobody')).resolves.toBeNull();
+    await expect(resolveHandle('alvin')).resolves.toBeNull();
+    expect(sdkMock.resolveHandle.mock.calls).toEqual([['alvin'], ['nobody'], ['alvin']]);
+  });
+
+  it('is null for an empty handle or without a configured registry, and never calls the RPC', async () => {
+    await expect(resolveHandle('')).resolves.toBeNull();
+    registry = '';
+    await expect(resolveHandle('alvin')).resolves.toBeNull();
+    expect(sdkMock.resolveHandle).not.toHaveBeenCalled();
   });
 });
 
@@ -211,6 +245,7 @@ describe('reverseHandles', () => {
 
   beforeEach(() => {
     readPublicMock.mockReset();
+    sdkMock.reverseHandle.mockReset();
     registry = 'CREGISTRY';
   });
 
@@ -238,22 +273,22 @@ describe('reverseHandles', () => {
   });
 
   it('falls back to one reverse per address on a registry without reverse_many', async () => {
-    readPublicMock.mockImplementation(async (_id: string, method: string, [arg]: [{ __addr: string }]) => {
+    readPublicMock.mockImplementation(async (_id: string, method: string) => {
       if (method === 'reverse_many') throw new Error(MISSING_REVERSE_MANY);
-      if (method === 'reverse') return handleOf(arg.__addr);
       throw new Error(`unexpected ${method}`);
     });
+    sdkMock.reverseHandle.mockImplementation(async (a: string) => handleOf(a));
     const input = addrs(60);
     const out = await reverseHandles(input);
     expect(calls('reverse_many')).toHaveLength(2);
-    expect(calls('reverse')).toHaveLength(60);
+    expect(sdkMock.reverseHandle).toHaveBeenCalledTimes(60);
     expect(out).toEqual(Object.fromEntries(input.map((a) => [a, handleOf(a)])));
   });
 
   it('leaves a chunk unlabelled when the read fails for another reason, without fanning out', async () => {
     readPublicMock.mockRejectedValue(new Error('fetch failed'));
     await expect(reverseHandles(addrs(3))).resolves.toEqual({ G000: null, G001: null, G002: null });
-    expect(calls('reverse')).toHaveLength(0);
+    expect(sdkMock.reverseHandle).not.toHaveBeenCalled();
   });
 
   it('treats a reply that does not line up with the request as unreadable', async () => {
@@ -337,13 +372,14 @@ describe('handle cooldown', () => {
 
   beforeEach(() => {
     readPublicMock.mockReset();
+    sdkMock.resolveHandle.mockReset();
     registry = 'CREGISTRY';
   });
 
-  /** Answer `resolve` and `cooldown` reads for one handle. */
+  /** Answer the `resolve` (through the SDK) and `cooldown` reads for one handle. */
   function chain(owner: string | null, cooldown: unknown) {
+    sdkMock.resolveHandle.mockResolvedValue(owner);
     readPublicMock.mockImplementation(async (_id: string, method: string) => {
-      if (method === 'resolve') return owner;
       if (method === 'cooldown') return cooldown;
       throw new Error(`unexpected ${method}`);
     });
@@ -390,11 +426,74 @@ describe('handle cooldown', () => {
     await expect(isHandleAvailable('alice', PREV)).resolves.toBe(true);
   });
 
-  it('is taken while held, and free when neither held nor cooling', async () => {
-    chain(PREV, null);
-    await expect(handleAvailability('alice', PREV)).resolves.toEqual({ status: 'taken' });
+  it('is owner-aware: a handle owned by the checking address is free for them to reclaim', async () => {
+    const OWNER = 'G'.padEnd(56, 'O');
+    const OTHER = 'G'.padEnd(56, 'X');
+    chain(OWNER, null);
+    // Owner can reclaim their own handle
+    await expect(handleAvailability('alice', OWNER)).resolves.toEqual({ status: 'free' });
+    await expect(isHandleAvailable('alice', OWNER)).resolves.toBe(true);
+    // But it's taken for anyone else
+    await expect(handleAvailability('alice', OTHER)).resolves.toEqual({ status: 'taken' });
+    await expect(isHandleAvailable('alice', OTHER)).resolves.toBe(false);
+    // And taken when no address is specified
+    await expect(handleAvailability('alice')).resolves.toEqual({ status: 'taken' });
+    await expect(isHandleAvailable('alice')).resolves.toBe(false);
+  });
+
+  it('is free when neither held nor cooling', async () => {
     chain(null, null);
     await expect(handleAvailability('alice')).resolves.toEqual({ status: 'free' });
     await expect(isHandleAvailable('alice')).resolves.toBe(true);
+  });
+});
+
+describe('on a ?network= override (#290)', () => {
+  // A ReadNetwork stand-in: its own registry id and SDK client, apart from the deployment's.
+  const netClient = { resolveHandle: vi.fn(), reverseHandle: vi.fn() };
+  const net = {
+    network: 'testnet',
+    contracts: { registry: 'CTESTREG', reputation: 'CTESTREP' },
+    client: netClient,
+  } as unknown as ReadNetwork;
+
+  beforeEach(() => {
+    readPublicMock.mockReset();
+    sdkMock.resolveHandle.mockReset();
+    netClient.resolveHandle.mockReset();
+    netClient.reverseHandle.mockReset();
+    clearMetaCache();
+    registry = 'CREGISTRY';
+  });
+
+  it("resolves a handle with the override's client, never the deployment's", async () => {
+    netClient.resolveHandle.mockResolvedValueOnce(G);
+    await expect(resolveHandle('umut', net)).resolves.toBe(G);
+    expect(netClient.resolveHandle).toHaveBeenCalledWith('umut');
+    expect(sdkMock.resolveHandle).not.toHaveBeenCalled();
+  });
+
+  it("reads through the override even where the deployment has no registry", async () => {
+    registry = '';
+    netClient.resolveHandle.mockResolvedValueOnce(G);
+    await expect(resolveHandle('umut', net)).resolves.toBe(G);
+    await expect(resolveHandle('umut')).resolves.toBeNull();
+  });
+
+  it("reads the override's get_meta, cached apart from the deployment's profile", async () => {
+    readPublicMock.mockResolvedValueOnce({ bio: 'on mainnet' }).mockResolvedValueOnce({ bio: 'on testnet' });
+    await expect(getMeta(G)).resolves.toMatchObject({ bio: 'on mainnet' });
+    await expect(getMeta(G, net)).resolves.toMatchObject({ bio: 'on testnet' });
+    expect(readPublicMock).toHaveBeenLastCalledWith('CTESTREG', 'get_meta', [{ __addr: G }], net);
+    // Both are cached now, each under its own network.
+    await expect(getMeta(G)).resolves.toMatchObject({ bio: 'on mainnet' });
+    await expect(getMeta(G, net)).resolves.toMatchObject({ bio: 'on testnet' });
+    expect(readPublicMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("labels a leaderboard from the override's registry", async () => {
+    readPublicMock.mockResolvedValueOnce(['umut']);
+    await expect(reverseHandles([G], net)).resolves.toEqual({ [G]: 'umut' });
+    expect(readPublicMock).toHaveBeenCalledWith('CTESTREG', 'reverse_many', [{ __addrs: [G] }], net);
   });
 });

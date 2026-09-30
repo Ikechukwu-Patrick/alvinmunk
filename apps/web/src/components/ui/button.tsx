@@ -8,7 +8,7 @@ const buttonVariants = cva(
     variants: {
       variant: {
         primary: 'bg-primary text-primary-foreground shadow-glow-primary hover:brightness-105',
-        flow: 'flow text-white shadow-glow-primary hover:brightness-110',
+        flow: 'flow text-secondary-foreground shadow-glow-primary hover:brightness-110',
         onchain: 'bg-onchain text-primary-foreground shadow-glow-onchain hover:brightness-105',
         outline: 'border border-border bg-transparent text-foreground hover:bg-muted',
         ghost: 'bg-transparent text-foreground/80 hover:bg-muted hover:text-foreground',
@@ -20,6 +20,8 @@ const buttonVariants = cva(
         md: 'h-11 px-6 text-sm',
         lg: 'h-12 px-7 text-base',
         icon: 'h-10 w-10',
+        // Inline edit / dismiss glyphs: a 32px hit area (WCAG 2.5.8 asks for 24px).
+        'icon-sm': 'h-8 w-8',
       },
     },
     defaultVariants: { variant: 'primary', size: 'md' },

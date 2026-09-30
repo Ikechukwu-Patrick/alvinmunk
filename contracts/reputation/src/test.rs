@@ -14,9 +14,8 @@ fn setup() -> (Env, ReputationContractClient<'static>, Address) {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
-    let id = env.register(ReputationContract, ());
+    let id = env.register(ReputationContract, (&admin,));
     let client = ReputationContractClient::new(&env, &id);
-    client.init(&admin);
     (env, client, admin)
 }
 
@@ -136,7 +135,6 @@ fn vouch_claim_secret_grants_asymmetric_social_xp() {
 }
 
 #[test]
-#[should_panic]
 fn claim_with_wrong_secret_reverts() {
     let (env, client, _admin) = setup();
     let alice = Address::generate(&env);
@@ -144,11 +142,13 @@ fn claim_with_wrong_secret_reverts() {
     let (_secret, hash) = secret_and_hash(&env, 7);
     let id = client.mint_vouch(&alice, &hash, &String::from_str(&env, "x"));
     let wrong = Bytes::from_array(&env, &[9u8; 32]);
-    client.claim_vouch(&bob, &id, &wrong); // panics: BadSecret
+    assert_eq!(
+        client.try_claim_vouch(&bob, &id, &wrong),
+        Err(Ok(contract_err(Error::BadSecret)))
+    );
 }
 
 #[test]
-#[should_panic]
 fn double_claim_reverts() {
     let (env, client, _admin) = setup();
     let alice = Address::generate(&env);
@@ -156,17 +156,22 @@ fn double_claim_reverts() {
     let (secret, hash) = secret_and_hash(&env, 7);
     let id = client.mint_vouch(&alice, &hash, &String::from_str(&env, "gg"));
     client.claim_vouch(&bob, &id, &secret);
-    client.claim_vouch(&bob, &id, &secret); // panics: AlreadyClaimed
+    assert_eq!(
+        client.try_claim_vouch(&bob, &id, &secret),
+        Err(Ok(contract_err(Error::AlreadyClaimed)))
+    );
 }
 
 #[test]
-#[should_panic]
 fn self_vouch_reverts() {
     let (env, client, _admin) = setup();
     let alice = Address::generate(&env);
     let (secret, hash) = secret_and_hash(&env, 7);
     let id = client.mint_vouch(&alice, &hash, &String::from_str(&env, "me"));
-    client.claim_vouch(&alice, &id, &secret); // panics: SelfVouch
+    assert_eq!(
+        client.try_claim_vouch(&alice, &id, &secret),
+        Err(Ok(contract_err(Error::SelfVouch)))
+    );
 }
 
 #[test]
@@ -191,7 +196,6 @@ fn repeated_pair_grants_no_more_social_xp() {
 }
 
 #[test]
-#[should_panic]
 fn daily_cap_reverts_on_overuse() {
     let (env, client, _admin) = setup();
     let alice = Address::generate(&env);
@@ -204,7 +208,10 @@ fn daily_cap_reverts_on_overuse() {
     }
     // the 21st mint in the same day exceeds the per-day cap.
     let (_s, h) = secret_and_hash(&env, 99);
-    client.mint_vouch(&alice, &h, &String::from_str(&env, "spam")); // panics: DailyCapReached
+    assert_eq!(
+        client.try_mint_vouch(&alice, &h, &String::from_str(&env, "spam")),
+        Err(Ok(contract_err(Error::DailyCapReached)))
+    );
 }
 
 /// The cap counts per voucher per UTC calendar day (`timestamp / DAY_SECS`), not over a
@@ -354,6 +361,7 @@ fn claim_after_expire_vouch_does_not_slash_twice() {
     let v = client.get_vouch(&id).unwrap();
     assert!(v.slashed && v.claimed);
     assert_eq!(client.get_score(&alice), 15); // stake stays slashed, never refunded
+    assert_eq!(client.get_score(&bob), STARTER_SOCIAL + XP_CLAIMER); // the claimer still earns
 }
 
 #[test]
@@ -370,13 +378,103 @@ fn expire_vouch_after_ttl_marks_slashed() {
 }
 
 #[test]
-#[should_panic]
 fn expire_vouch_before_ttl_reverts() {
     let (env, client, _admin) = setup();
     let alice = Address::generate(&env);
     let (_s, h) = secret_and_hash(&env, 7);
     let id = client.mint_vouch(&alice, &h, &String::from_str(&env, "x"));
-    client.expire_vouch(&id); // now=0 < TTL -> NotExpired
+    // now = 0, well inside the window
+    assert_eq!(
+        client.try_expire_vouch(&id),
+        Err(Ok(contract_err(Error::NotExpired)))
+    );
+    assert!(!client.get_vouch(&id).unwrap().slashed);
+}
+
+#[test]
+fn expire_vouch_unknown_id_reverts_with_vouch_not_found() {
+    let (env, client, _admin) = setup();
+    let alice = Address::generate(&env);
+    let (_s, h) = secret_and_hash(&env, 7);
+    let id = client.mint_vouch(&alice, &h, &String::from_str(&env, "x"));
+    env.ledger().with_mut(|l| l.timestamp = VOUCH_TTL_SECS + 1);
+    // The id right after the only minted card was never minted.
+    assert_eq!(
+        client.try_expire_vouch(&(id + 1)),
+        Err(Ok(contract_err(Error::VouchNotFound)))
+    );
+}
+
+/// Both claim entrypoints reject an id that was never minted, before checking the
+/// secret or signature.
+#[test]
+fn claim_vouch_unknown_id_reverts_with_vouch_not_found() {
+    let (env, client, _admin) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let (s, h) = secret_and_hash(&env, 7);
+    let id = client.mint_vouch(&alice, &h, &String::from_str(&env, "x"));
+    assert_eq!(
+        client.try_claim_vouch(&bob, &(id + 1), &s),
+        Err(Ok(contract_err(Error::VouchNotFound)))
+    );
+    assert_eq!(
+        client.try_claim_vouch_signed(&bob, &(id + 1), &BytesN::from_array(&env, &[0; 64])),
+        Err(Ok(contract_err(Error::VouchNotFound)))
+    );
+}
+
+/// A claimed card can't be slashed afterwards — not once its window has passed, and not
+/// inside it either (the claim check comes before the deadline check).
+#[test]
+fn expire_vouch_after_claim_reverts_with_already_claimed() {
+    let (env, client, _admin) = setup();
+    let alice = Address::generate(&env);
+    let bob = Address::generate(&env);
+    let (s, h) = secret_and_hash(&env, 7);
+    let id = client.mint_vouch(&alice, &h, &String::from_str(&env, "x"));
+    client.claim_vouch(&bob, &id, &s);
+    assert_eq!(
+        client.try_expire_vouch(&id),
+        Err(Ok(contract_err(Error::AlreadyClaimed)))
+    );
+    env.ledger().with_mut(|l| l.timestamp = VOUCH_TTL_SECS + 1);
+    assert_eq!(
+        client.try_expire_vouch(&id),
+        Err(Ok(contract_err(Error::AlreadyClaimed)))
+    );
+    assert!(!client.get_vouch(&id).unwrap().slashed);
+    assert_eq!(client.get_score(&alice), STARTER_SOCIAL); // the timely refund stands
+}
+
+/// A second `expire_vouch` on an already-slashed card is a no-op: it emits nothing (no
+/// second `vouch`/`slashed`) and touches no score.
+#[test]
+fn expire_vouch_is_idempotent() {
+    use soroban_sdk::{testutils::Events as _, vec, IntoVal, Val};
+    let (env, client, _admin) = setup();
+    let alice = Address::generate(&env);
+    let (_s, h) = secret_and_hash(&env, 7);
+    let id = client.mint_vouch(&alice, &h, &String::from_str(&env, "x"));
+    env.ledger().with_mut(|l| l.timestamp = VOUCH_TTL_SECS + 1);
+
+    client.expire_vouch(&id);
+    let slashed: (Address, Vec<Val>, Val) = (
+        client.address.clone(),
+        (symbol_short!("vouch"), symbol_short!("slashed")).into_val(&env),
+        (id, alice.clone(), VOUCH_STAKE).into_val(&env),
+    );
+    assert_eq!(env.events().all(), vec![&env, slashed]);
+    let score = client.get_score(&alice);
+    assert_eq!(score, STARTER_SOCIAL - VOUCH_STAKE);
+
+    client.expire_vouch(&id); // e.g. a second keeper run
+    assert!(
+        env.events().all().is_empty(),
+        "a re-expiry must not announce anything"
+    );
+    assert_eq!(client.get_score(&alice), score);
+    assert!(client.get_vouch(&id).unwrap().slashed);
 }
 
 /// `claim_vouch` (refund) and `expire_vouch` (slash) share one deadline, `created +
@@ -449,6 +547,32 @@ fn claim_deadline_saturates_at_the_end_of_time() {
     assert!(!client.get_vouch(&unclaimed).unwrap().slashed);
 }
 
+/// The expire deadline in isolation: at exactly `created + VOUCH_TTL_SECS` a card is still
+/// live (`NotExpired`), one second later it slashes — pinning the `<=` on `expire_vouch`
+/// independently of the claim side.
+#[test]
+fn expire_vouch_boundary_second() {
+    let (env, client, _admin) = setup();
+    let alice = Address::generate(&env);
+    let (_s, h) = secret_and_hash(&env, 7);
+    let created = 1_000u64;
+    env.ledger().with_mut(|l| l.timestamp = created);
+    let id = client.mint_vouch(&alice, &h, &String::from_str(&env, "x"));
+
+    env.ledger()
+        .with_mut(|l| l.timestamp = created + VOUCH_TTL_SECS);
+    assert_eq!(
+        client.try_expire_vouch(&id),
+        Err(Ok(contract_err(Error::NotExpired)))
+    );
+    assert!(!client.get_vouch(&id).unwrap().slashed);
+
+    env.ledger()
+        .with_mut(|l| l.timestamp = created + VOUCH_TTL_SECS + 1);
+    client.expire_vouch(&id);
+    assert!(client.get_vouch(&id).unwrap().slashed);
+}
+
 #[test]
 fn second_order_bonus_unlocks_on_verified_action() {
     let (env, client, _admin) = setup();
@@ -490,7 +614,6 @@ fn bonus_immediate_when_claimer_already_verified() {
 }
 
 #[test]
-#[should_panic]
 fn insufficient_stake_reverts() {
     let (env, client, _admin) = setup();
     let alice = Address::generate(&env);
@@ -501,7 +624,10 @@ fn insufficient_stake_reverts() {
     }
     assert_eq!(client.get_score(&alice), 0);
     let (_s, h) = secret_and_hash(&env, 4);
-    client.mint_vouch(&alice, &h, &String::from_str(&env, "x")); // panics: InsufficientStake
+    assert_eq!(
+        client.try_mint_vouch(&alice, &h, &String::from_str(&env, "x")),
+        Err(Ok(contract_err(Error::InsufficientStake)))
+    );
 }
 
 #[test]
@@ -519,12 +645,14 @@ fn attester_award_credits_earned_only() {
 }
 
 #[test]
-#[should_panic]
 fn non_allowlisted_attester_reverts() {
     let (env, client, _admin) = setup();
     let imposter = Address::generate(&env);
     let user = Address::generate(&env);
-    client.award_xp(&imposter, &user, &2u32, &50u64); // panics: NotAuthorized
+    assert_eq!(
+        client.try_award_xp(&imposter, &user, &2u32, &50u64),
+        Err(Ok(contract_err(Error::NotAuthorized)))
+    );
 }
 
 #[test]
@@ -1297,9 +1425,8 @@ fn upgrade_keeps_notes_and_enforces_the_note_cap() {
 fn non_admin_upgrade_reverts() {
     let env = Env::default();
     let admin = Address::generate(&env);
-    let id = env.register(ReputationContract, ());
+    let id = env.register(ReputationContract, (&admin,));
     let client = ReputationContractClient::new(&env, &id);
-    client.init(&admin);
     let hash = soroban_sdk::BytesN::from_array(&env, &[1; 32]);
     client.upgrade(&hash);
 }
@@ -1325,9 +1452,8 @@ fn setup_with_ttls(
     });
     env.mock_all_auths();
     let admin = Address::generate(&env);
-    let id = env.register(ReputationContract, ());
+    let id = env.register(ReputationContract, (&admin,));
     let client = ReputationContractClient::new(&env, &id);
-    client.init(&admin);
     (env, client)
 }
 
@@ -1598,8 +1724,7 @@ fn claim_signature_does_not_replay_on_another_vouch() {
 #[test]
 fn claim_signature_does_not_replay_on_another_deployment() {
     let (env, client, admin) = setup_testnet();
-    let other = ReputationContractClient::new(&env, &env.register(ReputationContract, ()));
-    other.init(&admin);
+    let other = ReputationContractClient::new(&env, &env.register(ReputationContract, (&admin,)));
     let alice = Address::generate(&env);
     let bob = Address::generate(&env);
     let sk = link_key(7);
@@ -1780,7 +1905,7 @@ fn claim_message_matches_the_documented_bytes() {
         &env,
         "CAIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRDB3V",
     );
-    env.register_at(&contract, ReputationContract, ());
+    env.register_at(&contract, ReputationContract, (Address::generate(&env),));
     let classic = Address::from_str(
         &env,
         "GARCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCFRVX",
@@ -1929,4 +2054,504 @@ fn remove_attester_revokes_authorization_and_leaves_prior_awards_intact() {
     assert_eq!(client.get_earned(&user), 10);
     let record = client.get_attestation(&user, &2).unwrap();
     assert_eq!((record.value, record.issuer), (10, att.clone()));
+}
+
+// --- Batch vouch (issue #271) ---
+
+/// `n` distinct share-link keys (seeds `fill`, `fill + 1`, ...) and their public claim keys.
+fn link_keys(env: &Env, n: u32, fill: u8) -> (std::vec::Vec<SigningKey>, Vec<BytesN<32>>) {
+    let sks: std::vec::Vec<SigningKey> = (0..n).map(|i| link_key(fill + i as u8)).collect();
+    let mut keys = Vec::new(env);
+    for sk in &sks {
+        keys.push_back(claim_pubkey(env, sk));
+    }
+    (sks, keys)
+}
+
+/// `n` notes, `"<prefix><i>"`.
+fn batch_notes(env: &Env, n: u32, prefix: &str) -> Vec<String> {
+    let mut notes = Vec::new(env);
+    for i in 0..n {
+        notes.push_back(String::from_str(env, &std::format!("{prefix}{i}")));
+    }
+    notes
+}
+
+/// Today's `DailyCount` for `who` (0 when there is none).
+fn daily_count(env: &Env, client: &ReputationContractClient, who: &Address) -> u32 {
+    let key = DataKey::DailyCount(who.clone(), env.ledger().timestamp() / DAY_SECS);
+    env.as_contract(&client.address, || {
+        env.storage().temporary().get(&key).unwrap_or(0)
+    })
+}
+
+/// Give `who` Social XP beyond the starter 20: `claims` fresh vouchers each vouch for them.
+fn fund_social(env: &Env, client: &ReputationContractClient, who: &Address, claims: u8) {
+    for i in 0..claims {
+        vouch(env, client, &Address::generate(env), who, 200 + i);
+    }
+}
+
+#[test]
+fn batch_errors_are_appended_after_wrong_claim_method() {
+    // Deployed web builds map #1..#13; the batch codes must not renumber any of them.
+    assert_eq!(Error::NoteTooLong as u32, 12);
+    assert_eq!(Error::WrongClaimMethod as u32, 13);
+    assert_eq!(Error::LengthMismatch as u32, 14);
+    assert_eq!(Error::BadBatchSize as u32, 15);
+    assert_eq!(MAX_BATCH_VOUCH, 10);
+}
+
+/// One signature mints N key-bound half-cards, and each one claims only with its own key.
+#[test]
+fn mint_vouches_mints_cards_that_each_claim_with_their_own_key() {
+    let (env, client, _admin) = setup_testnet();
+    let alice = Address::generate(&env);
+    let (sks, keys) = link_keys(&env, 3, 1);
+    let notes = batch_notes(&env, 3, "cohort ");
+
+    let ids = client.mint_vouches(&alice, &keys, &notes);
+    assert_eq!(ids, soroban_sdk::vec![&env, 1u64, 2, 3]);
+    for (i, id) in ids.iter().enumerate() {
+        let v = client.get_vouch(&id).unwrap();
+        assert_eq!((v.id, v.from.clone()), (id, alice.clone()));
+        assert_eq!(v.note, notes.get(i as u32).unwrap());
+        assert_eq!(v.claim_hash, BytesN::from_array(&env, &[0; 32]));
+        assert!(!v.claimed && !v.slashed);
+        assert_eq!(client.get_claim_key(&id), Some(keys.get(i as u32).unwrap()));
+    }
+    assert_eq!(client.get_score(&alice), STARTER_SOCIAL - 3 * VOUCH_STAKE);
+
+    // A card's key signs for that card only, and a keyed card never takes a secret.
+    let (bob, carol) = (Address::generate(&env), Address::generate(&env));
+    let wrong = claim_sig(&env, &client, &sks[0], 2, &bob);
+    assert_bad_signature(|| client.claim_vouch_signed(&bob, &2, &wrong));
+    assert_eq!(
+        client.try_claim_vouch(&bob, &1, &Bytes::from_array(&env, &[1; 32])),
+        Err(Ok(contract_err(Error::WrongClaimMethod)))
+    );
+    for (i, claimer) in [bob, carol, Address::generate(&env)].iter().enumerate() {
+        let id = ids.get(i as u32).unwrap();
+        client.claim_vouch_signed(
+            claimer,
+            &id,
+            &claim_sig(&env, &client, &sks[i], id, claimer),
+        );
+        assert_eq!(
+            client.get_vouch(&id).unwrap().claimer,
+            Some(claimer.clone())
+        );
+    }
+    // every timely claim refunded its own stake
+    assert_eq!(client.get_score(&alice), STARTER_SOCIAL);
+}
+
+/// The whole batch sits under one authorization of `from`, over every key and note.
+#[test]
+fn mint_vouches_takes_one_auth_from_the_voucher() {
+    use soroban_sdk::testutils::{AuthorizedFunction, AuthorizedInvocation};
+    let (env, client, _admin) = setup();
+    let alice = Address::generate(&env);
+    let (_sks, keys) = link_keys(&env, 4, 1);
+    let notes = batch_notes(&env, 4, "n");
+
+    client.mint_vouches(&alice, &keys, &notes);
+    assert_eq!(
+        env.auths(),
+        std::vec![(
+            alice.clone(),
+            AuthorizedInvocation {
+                function: AuthorizedFunction::Contract((
+                    client.address.clone(),
+                    Symbol::new(&env, "mint_vouches"),
+                    (alice.clone(), keys.clone(), notes.clone()).into_val(&env),
+                )),
+                sub_invocations: std::vec![],
+            }
+        )]
+    );
+}
+
+/// Indexers and the feed see a batch exactly as N `mint_vouch_signed` calls: per card, the
+/// stake debit then `("vouch","minted")`, carrying the running balance and the card's id.
+#[test]
+fn mint_vouches_emits_what_single_mints_emit() {
+    use soroban_sdk::testutils::Events as _;
+    let (env, client, _admin) = setup();
+    let (alice, bob) = (Address::generate(&env), Address::generate(&env));
+    let expected = |who: &Address, first_id: u64, n: u64| {
+        let mut out: Vec<(Address, Vec<Val>, Val)> = Vec::new(&env);
+        for k in 0..n {
+            out.push_back((
+                client.address.clone(),
+                (symbol_short!("social"), who.clone()).into_val(&env),
+                (VOUCH_STAKE, STARTER_SOCIAL - (k + 1) * VOUCH_STAKE).into_val(&env),
+            ));
+            out.push_back((
+                client.address.clone(),
+                (symbol_short!("vouch"), symbol_short!("minted")).into_val(&env),
+                (first_id + k, who.clone()).into_val(&env),
+            ));
+        }
+        out
+    };
+
+    let (_sks, keys) = link_keys(&env, 3, 1);
+    client.mint_vouches(&alice, &keys, &batch_notes(&env, 3, "n"));
+    assert_eq!(env.events().all(), expected(&alice, 1, 3));
+
+    // The same three cards minted one call at a time: the same events, split per call.
+    let singles = expected(&bob, 4, 3);
+    for (k, key) in keys.iter().enumerate() {
+        client.mint_vouch_signed(&bob, &key, &String::from_str(&env, "n"));
+        let k = k as u32;
+        assert_eq!(env.events().all(), singles.slice(2 * k..2 * k + 2));
+    }
+}
+
+/// A batch writes what N single mints write: each `Vouch` and `ClaimPubkey` with the same
+/// fields and TTLs, the same stake debit, starter flag and per-day count.
+#[test]
+fn mint_vouches_writes_what_single_mints_write() {
+    for ttls in [TESTNET_TTLS, MAINNET_TTLS] {
+        let (env, client) = setup_with_ttls(ttls);
+        let (alice, bob) = (Address::generate(&env), Address::generate(&env));
+        let (_sks, keys) = link_keys(&env, 3, 1);
+        let notes = batch_notes(&env, 3, "n");
+
+        let batch = client.mint_vouches(&alice, &keys, &notes);
+        let mut singles = std::vec::Vec::new();
+        for (key, note) in keys.iter().zip(notes.iter()) {
+            singles.push(client.mint_vouch_signed(&bob, &key, &note));
+        }
+
+        assert_eq!(client.get_score(&alice), client.get_score(&bob));
+        assert_eq!(daily_count(&env, &client, &alice), 3);
+        assert_eq!(daily_count(&env, &client, &bob), 3);
+        for (i, (a, b)) in batch.iter().zip(singles).enumerate() {
+            let (va, vb) = (client.get_vouch(&a).unwrap(), client.get_vouch(&b).unwrap());
+            assert_eq!(
+                (
+                    va.claim_hash,
+                    va.note,
+                    va.claimed,
+                    va.claimer,
+                    va.created,
+                    va.stake,
+                    va.slashed
+                ),
+                (
+                    vb.claim_hash,
+                    vb.note,
+                    vb.claimed,
+                    vb.claimer,
+                    vb.created,
+                    vb.stake,
+                    vb.slashed
+                )
+            );
+            assert_eq!(client.get_claim_key(&a), client.get_claim_key(&b));
+            assert_eq!(client.get_claim_key(&a), Some(keys.get(i as u32).unwrap()));
+            for (ka, kb) in [
+                (DataKey::Vouch(a), DataKey::Vouch(b)),
+                (DataKey::ClaimPubkey(a), DataKey::ClaimPubkey(b)),
+            ] {
+                assert_eq!(ttl(&env, &client, &ka), BUMP_EXTEND);
+                assert_eq!(ttl(&env, &client, &ka), ttl(&env, &client, &kb));
+            }
+        }
+        let day = env.ledger().timestamp() / DAY_SECS;
+        assert_eq!(
+            temp_ttl(&env, &client, &DataKey::DailyCount(alice.clone(), day)),
+            temp_ttl(&env, &client, &DataKey::DailyCount(bob.clone(), day))
+        );
+        assert_eq!(
+            ttl(&env, &client, &DataKey::Started(alice)),
+            ttl(&env, &client, &DataKey::Started(bob))
+        );
+    }
+}
+
+/// Mismatched vectors, an empty batch and one over `MAX_BATCH_VOUCH` revert before minting.
+#[test]
+fn mint_vouches_rejects_bad_batch_shapes() {
+    let (env, client, _admin) = setup();
+    let alice = Address::generate(&env);
+    fund_social(&env, &client, &alice, 4); // 60 Social XP: stake is never the limit here
+    let before = client.get_score(&alice);
+    let (_sks, keys) = link_keys(&env, MAX_BATCH_VOUCH + 1, 1);
+    let first = |n: u32| keys.slice(0..n);
+
+    for (keys, notes, err) in [
+        (first(2), batch_notes(&env, 1, "n"), Error::LengthMismatch),
+        (first(1), batch_notes(&env, 2, "n"), Error::LengthMismatch),
+        (first(0), batch_notes(&env, 0, "n"), Error::BadBatchSize),
+        (
+            first(MAX_BATCH_VOUCH + 1),
+            batch_notes(&env, MAX_BATCH_VOUCH + 1, "n"),
+            Error::BadBatchSize,
+        ),
+    ] {
+        assert_eq!(
+            client.try_mint_vouches(&alice, &keys, &notes),
+            Err(Ok(contract_err(err)))
+        );
+    }
+    assert_eq!(client.get_score(&alice), before);
+    assert_eq!(daily_count(&env, &client, &alice), 0);
+    // the four funding cards took ids 1..=4; nothing after them was minted
+    assert!(client.get_vouch(&5).is_none());
+}
+
+/// A batch of exactly `MAX_BATCH_VOUCH` mints every card and escrows every stake.
+#[test]
+fn mint_vouches_accepts_a_full_batch() {
+    let (env, client, _admin) = setup();
+    let alice = Address::generate(&env);
+    fund_social(&env, &client, &alice, 3);
+    assert_eq!(client.get_score(&alice), 50);
+
+    let (_sks, keys) = link_keys(&env, MAX_BATCH_VOUCH, 1);
+    let ids = client.mint_vouches(&alice, &keys, &batch_notes(&env, MAX_BATCH_VOUCH, "n"));
+    assert_eq!(ids.len(), MAX_BATCH_VOUCH);
+    assert_eq!(ids.first(), Some(4)); // after the three funding cards
+    assert_eq!(ids.last(), Some(3 + MAX_BATCH_VOUCH as u64));
+    assert_eq!(client.get_score(&alice), 0);
+    assert_eq!(daily_count(&env, &client, &alice), MAX_BATCH_VOUCH);
+}
+
+/// Every card counts against `MAX_VOUCH_PER_DAY`, together with single mints from either
+/// entrypoint; a batch that would cross the cap reverts whole, not up to the cap.
+#[test]
+fn mint_vouches_over_the_daily_cap_reverts_the_whole_batch() {
+    let (env, client, _admin) = setup();
+    let (alice, bob) = (Address::generate(&env), Address::generate(&env));
+    // 19 legacy mints today, each claimed at once so the stake comes back.
+    for i in 0..(MAX_VOUCH_PER_DAY - 1) {
+        vouch(&env, &client, &alice, &bob, i as u8);
+    }
+    let (score, next_id) = (client.get_score(&alice), u64::from(MAX_VOUCH_PER_DAY));
+
+    let (_sks, keys) = link_keys(&env, 2, 100);
+    assert_eq!(
+        client.try_mint_vouches(&alice, &keys, &batch_notes(&env, 2, "n")),
+        Err(Ok(contract_err(Error::DailyCapReached)))
+    );
+    // Not even the card that fit was minted, and the day's count did not move.
+    assert!(client.get_vouch(&next_id).is_none());
+    assert_eq!(client.get_score(&alice), score);
+    assert_eq!(daily_count(&env, &client, &alice), MAX_VOUCH_PER_DAY - 1);
+
+    // The last slot is still there for a batch of one; then the day is full.
+    let one = keys.slice(0..1);
+    assert_eq!(
+        client
+            .mint_vouches(&alice, &one, &batch_notes(&env, 1, "n"))
+            .len(),
+        1
+    );
+    assert_eq!(daily_count(&env, &client, &alice), MAX_VOUCH_PER_DAY);
+    let last = keys.slice(1..2);
+    assert_eq!(
+        client.try_mint_vouches(&alice, &last, &batch_notes(&env, 1, "n")),
+        Err(Ok(contract_err(Error::DailyCapReached)))
+    );
+}
+
+/// Each card escrows its own stake: a batch the balance cannot cover reverts whole,
+/// starter grant included.
+#[test]
+fn mint_vouches_without_enough_stake_reverts_the_whole_batch() {
+    let (env, client, _admin) = setup();
+    let alice = Address::generate(&env);
+    // The starter 20 covers four stakes of 5, not five.
+    let (_sks, keys) = link_keys(&env, 5, 1);
+    assert_eq!(
+        client.try_mint_vouches(&alice, &keys, &batch_notes(&env, 5, "n")),
+        Err(Ok(contract_err(Error::InsufficientStake)))
+    );
+    assert_eq!(client.get_score(&alice), 0);
+    assert!(client.get_vouch(&1).is_none());
+    assert_eq!(client.get_claim_key(&1), None);
+    assert_eq!(daily_count(&env, &client, &alice), 0);
+
+    let four = keys.slice(0..4);
+    client.mint_vouches(&alice, &four, &batch_notes(&env, 4, "n"));
+    assert_eq!(client.get_score(&alice), 0);
+}
+
+/// One note over `MAX_NOTE_BYTES` reverts the batch; notes at the cap all mint.
+#[test]
+fn mint_vouches_shares_the_note_cap() {
+    let (env, client, _admin) = setup();
+    let alice = Address::generate(&env);
+    let (_sks, keys) = link_keys(&env, 4, 1);
+    let mut notes = Vec::new(&env);
+    for text in notes_at_cap() {
+        notes.push_back(String::from_str(&env, &text));
+    }
+    let mut too_long = notes.clone();
+    too_long.set(2, String::from_str(&env, &"a".repeat(241)));
+    assert_eq!(
+        client.try_mint_vouches(&alice, &keys, &too_long),
+        Err(Ok(contract_err(Error::NoteTooLong)))
+    );
+    assert!(client.get_vouch(&1).is_none());
+
+    let ids = client.mint_vouches(&alice, &keys, &notes);
+    for (i, id) in ids.iter().enumerate() {
+        assert_eq!(
+            client.get_vouch(&id).unwrap().note,
+            notes.get(i as u32).unwrap()
+        );
+    }
+}
+
+/// A full batch of cap-length notes against the release build stays far inside the
+/// per-transaction limits `MAX_BATCH_VOUCH` was sized for (testnet and mainnet, checked
+/// 2026-09-29).
+#[test]
+fn a_full_mint_vouches_fits_one_transaction() {
+    const TX_MAX_INSTRUCTIONS: i64 = 400_000_000;
+    const TX_MAX_WRITE_ENTRIES: u32 = 200;
+    const TX_MAX_WRITE_BYTES: u32 = 132_096;
+    const TX_MAX_EVENTS_BYTES: u32 = 16_384;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(REPUTATION_WASM, (&Address::generate(&env),));
+    let client = ReputationContractClient::new(&env, &id);
+    let alice = Address::generate(&env);
+    fund_social(&env, &client, &alice, 3);
+
+    let (_sks, keys) = link_keys(&env, MAX_BATCH_VOUCH, 1);
+    let mut notes = Vec::new(&env);
+    for _ in 0..MAX_BATCH_VOUCH {
+        notes.push_back(String::from_str(&env, &"💧".repeat(60)));
+    }
+    client.mint_vouches(&alice, &keys, &notes);
+    let used = env.cost_estimate().resources();
+    // a `Vouch` and a `ClaimPubkey` per card, plus the day's count, the balance, the
+    // instance (the vouch sequence) and the voucher's one auth nonce
+    assert_eq!(used.write_entries, 2 * MAX_BATCH_VOUCH + 4, "{used:?}");
+    assert!(used.write_entries < TX_MAX_WRITE_ENTRIES / 4, "{used:?}");
+    assert!(used.write_bytes < TX_MAX_WRITE_BYTES / 4, "{used:?}");
+    assert!(
+        used.contract_events_size_bytes < TX_MAX_EVENTS_BYTES / 4,
+        "{used:?}"
+    );
+    assert!(used.instructions < TX_MAX_INSTRUCTIONS / 4, "{used:?}");
+}
+
+/// The upgraded build serves `mint_vouches` on the deployed state: ids continue after the
+/// cards minted before the upgrade, which still claim as before.
+#[test]
+fn upgrade_serves_mint_vouches_and_keeps_numbering() {
+    let (env, client, _admin) = setup_testnet();
+    let (alice, bob) = (Address::generate(&env), Address::generate(&env));
+    let (s1, h1) = secret_and_hash(&env, 1);
+    let old = client.mint_vouch(&alice, &h1, &String::from_str(&env, "old"));
+
+    let hash = env.deployer().upload_contract_wasm(REPUTATION_WASM);
+    client.upgrade(&hash);
+
+    let (sks, keys) = link_keys(&env, 2, 1);
+    let ids = client.mint_vouches(&alice, &keys, &batch_notes(&env, 2, "n"));
+    assert_eq!(ids, soroban_sdk::vec![&env, old + 1, old + 2]);
+    client.claim_vouch(&bob, &old, &s1);
+    let id = ids.get(1).unwrap();
+    client.claim_vouch_signed(&bob, &id, &claim_sig(&env, &client, &sks[1], id, &bob));
+    assert_eq!(client.get_vouch(&id).unwrap().claimer, Some(bob));
+}
+
+// --- Read-view fixtures for the TypeScript mirrors (issue #266) ---
+
+/// The `testdata/read_views.json` fixture: each read view's return value as the XDR (hex) of
+/// the `ScVal` a client gets back from RPC. `packages/shared` decodes the same file into its
+/// `Vouch` / `Profile` mirrors (`read-views.test.ts`), so a change to either struct fails
+/// here first. Rerun with `UPDATE_READ_VIEWS=1` to rewrite the file, then update the mirrors.
+#[test]
+fn read_view_fixtures_match_the_contract() {
+    use soroban_sdk::{
+        xdr::{Limits, ScVal, WriteXdr},
+        IntoVal, TryFromVal, Val,
+    };
+    fn hex(env: &Env, v: impl IntoVal<Env, Val>) -> std::string::String {
+        let sc = ScVal::try_from_val(env, &v.into_val(env)).unwrap();
+        // Qualified: the crate's `ToXdr` (in scope via `super::*`) has a `to_xdr` too.
+        let bytes = WriteXdr::to_xdr(&sc, Limits::none()).unwrap();
+        bytes.iter().map(|b| std::format!("{b:02x}")).collect()
+    }
+
+    let (env, client, _admin) = setup();
+    env.ledger().with_mut(|l| l.timestamp = 1_758_633_600);
+    // Accounts whose keys are 32 × 0x11 and 32 × 0x22.
+    let voucher = Address::from_str(
+        &env,
+        "GAIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCF6M",
+    );
+    let claimer = Address::from_str(
+        &env,
+        "GARCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCFRVX",
+    );
+    let attester = Address::generate(&env);
+    client.add_attester(&attester);
+
+    // A claimed card (stake refunded), then an unclaimed one a keeper slashed after the TTL.
+    let (secret, hash) = secret_and_hash(&env, 7);
+    let note = String::from_str(&env, "solid work on the quest");
+    let claimed = client.mint_vouch(&voucher, &hash, &note);
+    client.claim_vouch(&claimer, &claimed, &secret);
+    let (_, hash2) = secret_and_hash(&env, 9);
+    let slashed = client.mint_vouch(&voucher, &hash2, &String::from_str(&env, ""));
+    env.ledger().with_mut(|l| l.timestamp += VOUCH_TTL_SECS + 1);
+    client.expire_vouch(&slashed);
+    // Social from the claim, Earned (and verified) from one quest award.
+    client.award_xp(&attester, &claimer, &2u32, &50u64);
+
+    let fixtures = [
+        ("get_vouch_claimed", hex(&env, client.get_vouch(&claimed))),
+        ("get_vouch_slashed", hex(&env, client.get_vouch(&slashed))),
+        ("get_vouch_absent", hex(&env, client.get_vouch(&999))),
+        ("get_profile", hex(&env, client.get_profile(&claimer))),
+    ];
+    let mut json = std::string::String::from("{\n");
+    for (i, (name, xdr)) in fixtures.iter().enumerate() {
+        let comma = if i + 1 < fixtures.len() { "," } else { "" };
+        json.push_str(&std::format!("  \"{name}\": \"{xdr}\"{comma}\n"));
+    }
+    json.push_str("}\n");
+
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/read_views.json");
+    if std::env::var_os("UPDATE_READ_VIEWS").is_some() {
+        std::fs::write(path, &json).unwrap();
+    }
+    let committed = std::fs::read_to_string(path).unwrap_or_default();
+    assert!(
+        committed == json,
+        "testdata/read_views.json is stale: rerun with UPDATE_READ_VIEWS=1 and update the \
+         packages/shared mirrors. Current fixture:\n{json}"
+    );
+}
+
+/// #127: the release build is set up by its constructor, inside the deploy — registering it
+/// takes the constructor's arguments, it has no `init` left for anyone to call afterwards,
+/// and `upgrade` asks the constructor's admin to sign.
+#[test]
+fn the_release_build_is_set_up_by_its_constructor() {
+    use soroban_sdk::IntoVal as _;
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = soroban_sdk::Address::generate(&env);
+    let id = env.register(REPUTATION_WASM, (&admin,));
+    let init = soroban_sdk::Symbol::new(&env, "init");
+    let impostor = soroban_sdk::Address::generate(&env);
+    let call = soroban_sdk::vec![&env, impostor.into_val(&env)];
+    assert!(env
+        .try_invoke_contract::<(), soroban_sdk::Error>(&id, &init, call)
+        .is_err());
+
+    let hash = env.deployer().upload_contract_wasm(REPUTATION_WASM);
+    ReputationContractClient::new(&env, &id).upgrade(&hash);
+    assert_eq!(env.auths()[0].0, admin);
 }

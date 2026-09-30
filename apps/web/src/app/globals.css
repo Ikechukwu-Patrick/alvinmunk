@@ -18,7 +18,7 @@
   --popover-foreground: 250 28% 96%;
 
   --primary: 265 100% 66%; /* electric violet — primary / chain */
-  --primary-foreground: 0 0% 100%;
+  --primary-foreground: 265 60% 6%;
 
   --secondary: 157 84% 52%; /* mint green — earned / verified energy */
   --secondary-foreground: 265 60% 6%;
@@ -30,9 +30,20 @@
   --accent-foreground: 265 60% 6%;
 
   --destructive: 350 82% 62%;
-  --destructive-foreground: 250 30% 97%;
+  --destructive-foreground: 265 60% 6%;
   --success: 157 84% 52%;
   --warning: 38 95% 62%;
+  /* Text variants of the semantic colours: what text-* utilities read (tailwind textColor).
+     4.5:1 on every surface in both themes; bg-, border- and ring- keep the fills above. */
+  --primary-text: 265 100% 72%;
+  --onchain-text: 265 100% 72%;
+  --secondary-text: 157 84% 52%;
+  --success-text: 157 84% 52%;
+  --accent-text: 36 100% 64%;
+  --warning-text: 38 95% 62%;
+  --destructive-text: 350 82% 64%;
+  --tertiary-text: 193 100% 52%;
+  --lime-text: 79 94% 64%;
 
   --border: 265 26% 16%;
   --input: 265 26% 16%;
@@ -44,6 +55,8 @@
 
   /* the signature flow + depth surfaces */
   --tertiary: 193 100% 52%; /* cyan — social / connection */
+  /* violet stop of .flow, kept light enough for the dark flow-button label to clear AA */
+  --flow-violet: 265 100% 66%;
   --surface: 266 34% 9%;
   --surface-2: 266 30% 12%;
   --hairline: 260 60% 100%;
@@ -79,9 +92,18 @@
   --accent: 36 100% 55%;
   --accent-foreground: 265 60% 8%;
   --destructive: 350 82% 55%;
-  --destructive-foreground: 250 30% 98%;
+  --destructive-foreground: 265 60% 8%;
   --success: 157 84% 45%;
   --warning: 38 95% 55%;
+  --primary-text: 265 100% 54%;
+  --onchain-text: 265 100% 54%;
+  --secondary-text: 157 84% 24%;
+  --success-text: 157 84% 24%;
+  --accent-text: 36 100% 28%;
+  --warning-text: 38 95% 28%;
+  --destructive-text: 350 82% 42%;
+  --tertiary-text: 193 100% 27%;
+  --lime-text: 79 94% 22%;
   --border: 265 26% 85%;
   --input: 265 26% 85%;
   --ring: 265 100% 60%;
@@ -89,6 +111,7 @@
   --onchain: 265 100% 60%;
   --radius: 0.875rem;
   --tertiary: 193 100% 45%;
+  --flow-violet: 265 100% 68%;
   --surface: 266 34% 97%;
   --surface-2: 266 30% 93%;
   --hairline: 260 60% 15%;
@@ -111,6 +134,24 @@
   }
   h1, h2, h3, h4 {
     @apply font-display tracking-tight;
+  }
+}
+
+@layer components {
+  /* Eyebrow — the small uppercase kicker above headings (chain-site rhythm); `eyebrow-mono` is
+     the same kicker in the mono face (technical / on-chain labels). The only uppercase kicker
+     styles: no hand-rolled letter-spacings. Component classes, so a colour or leading utility
+     on the same element overrides them. */
+  .eyebrow,
+  .eyebrow-mono {
+    font-size: 0.6875rem;
+    line-height: 1;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: hsl(var(--muted-foreground));
+  }
+  .eyebrow-mono {
+    font-family: var(--font-mono), monospace;
   }
 }
 
@@ -146,10 +187,10 @@
   .flow {
     background-image: linear-gradient(
       110deg,
-      hsl(var(--primary)),
+      hsl(var(--flow-violet)),
       hsl(var(--tertiary)),
       hsl(var(--secondary)),
-      hsl(var(--primary))
+      hsl(var(--flow-violet))
     );
     background-size: 280% 100%;
     animation: gradient-pan 8s ease-in-out infinite;
@@ -219,15 +260,6 @@
 
   .text-glow {
     text-shadow: 0 0 28px hsl(var(--primary) / 0.35);
-  }
-
-  /* Eyebrow — the small uppercase kicker above headings (chain-site rhythm). */
-  .eyebrow {
-    font-size: 0.6875rem;
-    line-height: 1;
-    letter-spacing: 0.22em;
-    text-transform: uppercase;
-    color: hsl(var(--muted-foreground));
   }
 
   /* Fluid hero display size — scales smoothly from mobile to desktop. */
