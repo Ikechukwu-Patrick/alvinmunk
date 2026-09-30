@@ -118,7 +118,14 @@ export const GET = withRoute('GET /api/cron/notify', async (req: NextRequest) =>
       continue;
     }
 
-    if (await isEventSeen(ev.id)) {
+    // The RPC sometimes omits the id — those cannot be deduplicated, so skip them.
+    const eventId = ev.id;
+    if (!eventId) {
+      processed++;
+      continue;
+    }
+
+    if (await isEventSeen(eventId)) {
       processed++;
       continue;
     }
@@ -158,7 +165,7 @@ export const GET = withRoute('GET /api/cron/notify', async (req: NextRequest) =>
       }
     }
 
-    await markEventSeen(ev.id);
+    await markEventSeen(eventId);
     processed++;
   }
 
